@@ -462,7 +462,7 @@
       },
       syncToCloud() {
         if (remoteStorageAvailable()) {
-          writeRemoteState(dbStateSnapshot()).catch(() => {});
+          writeRemoteState(defaultDemoData()).catch(() => {});
         }
       },
     };
@@ -492,13 +492,5 @@
       writeRemoteState,
       remoteStorageAvailable,
     };
-  }
-
-  function dbStateSnapshot() {
-    const browserWindow = getBrowserWindow();
-    if (!browserWindow || !browserWindow.portalDB || !browserWindow.portalDB.db) {
-      return defaultDemoData();
-    }
-    return browserWindow.portalDB.db.collection("students").get();
   }
 })();
