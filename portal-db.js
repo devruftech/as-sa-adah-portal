@@ -1,5 +1,7 @@
 (function () {
   const STORAGE_KEY = "As-sa'adah-islamic-academy-db";
+  const DEFAULT_REMOTE_COLLECTION = "portalData";
+  const DEFAULT_REMOTE_DOC = "schoolState";
 
   function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -97,6 +99,120 @@
     };
   }
 
+  function getBrowserWindow() {
+    return typeof window !== "undefined" ? window : null;
+  }
+
+  function getFirebaseConfig() {
+    const browserWindow = getBrowserWindow();
+    if (!browserWindow) return null;
+    const config =
+      browserWindow.PORTAL_FIREBASE_CONFIG ||
+      browserWindow.FIREBASE_CONFIG ||
+      browserWindow.__PORTAL_FIREBASE_CONFIG__;
+
+    if (!config || typeof config !== "object") return null;
+    if (!config.projectId && !config.apiKey) return null;
+    return config;
+  }
+
+  function ensureFirebaseSdk() {
+    const browserWindow = getBrowserWindow();
+    if (!browserWindow || !getFirebaseConfig()) return null;
+
+    if (browserWindow.firebase && browserWindow.firebase.firestore) {
+      return browserWindow.firebase;
+    }
+
+    const alreadyQueued = document.querySelector(
+      "script[data-portal-firebase-sdk='true']",
+    );
+    if (alreadyQueued) return null;
+
+    const appScript = document.createElement("script");
+    appScript.src = "https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js";
+    appScript.setAttribute("data-portal-firebase-sdk", "true");
+    document.head.appendChild(appScript);
+
+    const firestoreScript = document.createElement("script");
+    firestoreScript.src =
+      "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js";
+    firestoreScript.setAttribute("data-portal-firebase-sdk", "true");
+    document.head.appendChild(firestoreScript);
+
+    return null;
+  }
+
+  function getFirebaseDatabase() {
+    const browserWindow = getBrowserWindow();
+    if (!browserWindow || !browserWindow.firebase) return null;
+    const config = getFirebaseConfig();
+    if (!config) return null;
+
+    try {
+      const app = browserWindow.firebase.apps?.[0] || browserWindow.firebase.initializeApp(config);
+      const firestore = browserWindow.firebase.firestore(app);
+      browserWindow.__PORTAL_FIRESTORE__ = firestore;
+      return firestore;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function remoteStorageAvailable() {
+    const config = getFirebaseConfig();
+    if (!config) return false;
+    const browserWindow = getBrowserWindow();
+    if (!browserWindow) return false;
+    if (browserWindow.__PORTAL_FIRESTORE__) return true;
+    if (browserWindow.firebase && browserWindow.firebase.firestore) {
+      return !!getFirebaseDatabase();
+    }
+    return !!ensureFirebaseSdk();
+  }
+
+  async function readRemoteState() {
+    const browserWindow = getBrowserWindow();
+    const firestore = browserWindow && browserWindow.__PORTAL_FIRESTORE__;
+    if (!firestore) {
+      const firebaseDb = getFirebaseDatabase();
+      if (!firebaseDb) return null;
+      browserWindow.__PORTAL_FIRESTORE__ = firebaseDb;
+    }
+
+    try {
+      const snapshot = await firestore
+        .collection(DEFAULT_REMOTE_COLLECTION)
+        .doc(DEFAULT_REMOTE_DOC)
+        .get();
+      const data = snapshot && snapshot.exists ? snapshot.data() : null;
+      if (!data || !data.state) return null;
+      return clone(data.state);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async function writeRemoteState(state) {
+    const browserWindow = getBrowserWindow();
+    const firestore = browserWindow && browserWindow.__PORTAL_FIRESTORE__;
+    if (!firestore) {
+      const firebaseDb = getFirebaseDatabase();
+      if (!firebaseDb) return false;
+      browserWindow.__PORTAL_FIRESTORE__ = firebaseDb;
+    }
+
+    try {
+      await firestore
+        .collection(DEFAULT_REMOTE_COLLECTION)
+        .doc(DEFAULT_REMOTE_DOC)
+        .set({ state: clone(state), updatedAt: Date.now() }, { merge: true });
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
   function readPersistedState() {
     try {
       if (typeof localStorage === "undefined") return null;
@@ -114,6 +230,10 @@
       }
     } catch (error) {
       // ignore storage failures in private or restricted environments
+    }
+
+    if (remoteStorageAvailable()) {
+      writeRemoteState(state).catch(() => {});
     }
   }
 
@@ -161,11 +281,20 @@
 
   function createPortalDatabase(options = {}) {
     const persist = options.persist !== false;
-    let state = persist
-      ? readPersistedState() || defaultDemoData()
-      : defaultDemoData();
+    let state = persist ? readPersistedState() || defaultDemoData() : defaultDemoData();
     if (!state || typeof state !== "object") {
       state = defaultDemoData();
+    }
+
+    if (persist && remoteStorageAvailable()) {
+      readRemoteState()
+        .then((remoteState) => {
+          if (remoteState && typeof remoteState === "object") {
+            state = remoteState;
+            writePersistedState(state);
+          }
+        })
+        .catch(() => {});
     }
 
     function save() {
@@ -234,9 +363,7 @@
         set(data) {
           const collection = getCollection(collectionName);
           if (Array.isArray(collection)) {
-            const existing = collection.findIndex(
-              (item) => item.id === targetId,
-            );
+            const existing = collection.findIndex((item) => item.id === targetId);
             const record = { id: targetId, data: clone(data) };
             if (existing >= 0) collection[existing] = record;
             else collection.push(record);
@@ -333,6 +460,11 @@
       resetDemoData() {
         db.reset();
       },
+      syncToCloud() {
+        if (remoteStorageAvailable()) {
+          writeRemoteState(dbStateSnapshot()).catch(() => {});
+        }
+      },
     };
     browserWindow.claude = {
       use(name) {
@@ -340,6 +472,12 @@
         if (name === "user") return user;
         return null;
       },
+    };
+
+    browserWindow.__PORTAL_GLOBAL_STORAGE__ = {
+      remoteStorageAvailable,
+      readRemoteState,
+      writeRemoteState,
     };
   }
 
@@ -350,6 +488,17 @@
       STORAGE_KEY,
       normalizePhoneNumber,
       isStudentLinkedToParent,
+      readRemoteState,
+      writeRemoteState,
+      remoteStorageAvailable,
     };
+  }
+
+  function dbStateSnapshot() {
+    const browserWindow = getBrowserWindow();
+    if (!browserWindow || !browserWindow.portalDB || !browserWindow.portalDB.db) {
+      return defaultDemoData();
+    }
+    return browserWindow.portalDB.db.collection("students").get();
   }
 })();
